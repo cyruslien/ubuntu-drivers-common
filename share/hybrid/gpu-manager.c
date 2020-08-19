@@ -59,6 +59,8 @@
 #include <linux/limits.h>
 #include <sys/utsname.h>
 #include <libkmod.h>
+#include <json-c/json.h>
+#include <zlib.h>
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 
@@ -106,6 +108,7 @@ typedef enum {
     ON,
     OFF,
     ONDEMAND
+
 } prime_mode_settings;
 
 static char *log_file = NULL;
@@ -1729,6 +1732,132 @@ unload_again:
     return true;
 }
 
+static bool get_nvidia_driver_major_version(char  *major) {
+    size_t len = 0;
+    _cleanup_free_ char *driver_version = NULL;
+    _cleanup_fclose_ FILE *file = NULL;
+    char *nv_driver_version_path = "/sys/module/nvidia/version";
+    char *ret;
+
+    /* Check the driver version */
+    file = fopen(nv_driver_version_path, "r");
+
+    if (file == NULL) {
+        fprintf(log_handle, "can't open %s\n", nv_driver_version_path);
+        return false;
+    }
+
+    if (getline(&driver_version, &len, file) == -1) {
+        fprintf(log_handle, "can't get line from %s\n", nv_driver_version_path);
+        return false;
+    }
+
+    ret = strtok(driver_version, ".");
+    major = strcpy(major, ret);
+
+    if (major == NULL) {
+        fprintf(log_handle, "Warning: couldn't get the driver version from %s\n",
+                nv_driver_version_path);
+        return false;
+    }
+    return true;
+}
+
+bool uncompress_json_gz_file(char *json_gz_file, char **json_data) {
+	gzFile gzfile;
+	char buffer[4096];
+	char *tmp = NULL;
+	int i;
+	int err;
+	int len;
+	int raw_len=0;
+
+	gzfile = gzopen(json_gz_file,"r");
+
+	if (gzfile == NULL) {
+		fprintf(stderr, "gzopen error\n");
+		return false;
+    }
+
+	i=0;
+	for(;;) {
+		len = gzread(gzfile, buffer, sizeof(buffer));
+		if (len <= 0 ){
+            const char * error_string;
+            error_string = gzerror(gzfile, &err);
+            if (err) {
+                fprintf (log_handle, "Error: %s.\n", error_string);
+                return false;
+            }
+		}
+		raw_len +=len;
+		tmp = (char *)realloc(*json_data, raw_len);
+
+		if(!tmp) {
+			free(*json_data);
+			*json_data = NULL;
+			return false;
+		}
+		*json_data = tmp;
+		strncat(*json_data, buffer, len);
+
+		if (gzeof (gzfile))
+			break;
+
+		i++;
+	}
+
+	gzclose(gzfile);
+	return true;
+}
+
+static bool find_supported_gpus_json(char *the_json_file){
+    char nv_major_version[3];
+
+    if (get_nvidia_driver_major_version(nv_major_version) && atoi(nv_major_version) >= 450){
+        sprintf(the_json_file, "/usr/share/doc/nvidia-driver-%s/supported-gpus.json.gz", nv_major_version);
+        return true;
+    }
+    return false;
+}
+
+bool check_json_data(char *json_data, int deviceid) {
+	struct json_object *parsed_json;
+	struct json_object *chips;
+	struct json_object *chipi;
+	size_t n_chips;
+	size_t i;
+	const char *rets;
+	char deviceids[6] ;
+
+	sprintf(deviceids, "0x%X", deviceid);
+	parsed_json = json_tokener_parse(json_data);
+	json_object_object_get_ex(parsed_json, "chips", &chips);
+	n_chips = json_object_array_length(chips);
+
+	for(i=0;i<n_chips;i++) {
+		chipi = json_object_array_get_idx(chips, i);
+		rets = json_object_get_string(chipi);
+		if (strstr(rets, deviceids) && strstr(rets, "runtimepm"))
+				return true;
+	}
+	return false;
+}
+
+static bool is_nv_runtimepm_supported(int nv_device_id) {
+    char supported_gpus_json_file[60];
+	char *json_data = NULL;
+
+    if(find_supported_gpus_json(supported_gpus_json_file)){
+        if(uncompress_json_gz_file(supported_gpus_json_file, &json_data)) {
+			if(check_json_data(json_data,  nv_device_id)) {
+				free(json_data);
+				return true;
+			}
+		}
+    }
+    return false;
+}
 
 int main(int argc, char *argv[]) {
 
@@ -1757,6 +1886,7 @@ int main(int argc, char *argv[]) {
     bool amdgpu_is_pro = false;
     int offloading = false;
     int status = 0;
+    bool nvidia_runtimepm_supported = false;
 
     /* Vendor and device id (boot vga) */
     unsigned int boot_vga_vendor_id = 0, boot_vga_device_id = 0;
@@ -2150,6 +2280,8 @@ int main(int argc, char *argv[]) {
                 /* char *driver = NULL; */
                 if (info->vendor_id == NVIDIA) {
                     has_nvidia = true;
+                    nvidia_runtimepm_supported = is_nv_runtimepm_supported(info->device_id);
+                    fprintf(log_handle, "Is nvidia runtime pm supported? %s\n", nvidia_runtimepm_supported ? "yes" : "no");
                 }
                 else if (info->vendor_id == INTEL) {
                     has_intel = true;
