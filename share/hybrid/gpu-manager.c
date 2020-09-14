@@ -306,7 +306,7 @@ static bool act_upon_module_with_params(const char *module,
 
     if (params) {
         snprintf(command, sizeof(command), "%s %s %s",
-                 mode ? "/sbin/modprobe" : "/sbin/rmmod",
+                 mode ? "/sbin/modprobe -C /dev/null" : "/sbin/rmmod",
                  module, params);
         free(params);
     }
@@ -1046,6 +1046,36 @@ int count_connected_outputs(const char *device_name) {
     return connected_outputs;
 }
 
+int count_associated_output_ports(const char *device_name) {
+    char name[PATH_MAX];
+    struct dirent *dp;
+    DIR *dfd;
+    int associated_output_ports = 0;
+    char drm_dir[] = "/sys/class/drm";
+
+    if ((dfd = opendir(drm_dir)) == NULL) {
+        fprintf(stderr, "Warning: can't open %s\n", drm_dir);
+        return associated_output_ports;
+    }
+
+    while ((dp = readdir(dfd)) != NULL) {
+        if (!starts_with(dp->d_name, device_name))
+            continue;
+        if (strlen(drm_dir)+strlen(dp->d_name)+2 > sizeof(name))
+            fprintf(stderr, "Warning: name %s/%s too long\n",
+                    drm_dir, dp->d_name);
+        else {
+            /* Open the file for the connector */
+            snprintf(name, sizeof(name), "%s/%s/status", drm_dir, dp->d_name);
+            name[sizeof(name) - 1] = 0;
+            fprintf(log_handle, "\t%s\n", dp->d_name);
+            associated_output_ports++;
+        }
+    }
+    closedir(dfd);
+
+    return associated_output_ports;
+}
 
 /* See if the drm device created by a driver has any connected outputs.
  * Return 1 if outputs are connected, 0 if they're not, -1 if unknown
@@ -1074,6 +1104,8 @@ static int has_driver_connected_outputs(const char *driver) {
         snprintf(path, sizeof(path), "%s/%s", dri_dir, dir_entry->d_name);
         path[sizeof(path) - 1] = 0;
         fd = open(path, O_RDWR);
+        if( fd < 0)
+            printf("open %s fail\n", path);
         if (fd) {
             if ((version = drmGetVersion(fd))) {
                 /* Let's use strstr to catch the different backported
@@ -1120,6 +1152,79 @@ static int has_driver_connected_outputs(const char *driver) {
     return (connected_outputs > 0);
 }
 
+static int has_nv_link_output_ports(const char *driver) {
+    DIR *dir;
+    struct dirent* dir_entry;
+    char path[PATH_MAX];
+    int fd = 1;
+    drmVersionPtr version;
+    int associated_outputs = 0;
+    int driver_match = 0;
+    char dri_dir[] = "/dev/dri";
+    _cleanup_free_ char *device_path= NULL;
+
+    if (NULL == (dir = opendir(dri_dir))) {
+        fprintf(log_handle, "Error : Failed to open %s\n", dri_dir);
+        return -1;
+    }
+
+    /* Keep looking until we find the device for the driver */
+    while ((dir_entry = readdir(dir))) {
+        if (!starts_with(dir_entry->d_name, "card"))
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s", dri_dir, dir_entry->d_name);
+        path[sizeof(path) - 1] = 0;
+        fd = open(path, O_RDWR);
+        if( fd < 0)
+            printf("open %s fail\n", path);
+        if (fd) {
+            if ((version = drmGetVersion(fd))) {
+                /* Let's use strstr to catch the different backported
+                 * kernel modules
+                 */
+                if (strstr(version->name, driver) != NULL) {
+                    driver_match = 1;
+                    device_path = malloc(strlen(dir_entry->d_name)+1);
+                    if (device_path)
+                        strcpy(device_path, dir_entry->d_name);
+                        fprintf(log_handle, "Found \"%s\", driven by \"%s\", %s\n",
+                                                            path, version->name, device_path);
+                    drmFreeVersion(version);
+                    break;
+                }
+                else {
+                    fprintf(log_handle, "Skipping \"%s\", driven by \"%s\"\n",
+                            path, version->name);
+                    drmFreeVersion(version);
+                    close(fd);
+                }
+            }
+        }
+        else {
+            fprintf(log_handle, "Error: can't open fd for %s\n", path);
+            continue;
+        }
+    }
+
+    closedir(dir);
+
+    close(fd);
+
+    if (!driver_match)
+        return -1;
+
+    if (!device_path)
+        return -1;
+
+    return 0;
+
+    associated_outputs = count_associated_output_ports(device_path);
+
+    fprintf(log_handle, "Number of associated output ports for %s: %d\n", path, associated_outputs);
+
+    return (associated_outputs > 0);
+}
 
 /* Add information on connected outputs */
 static void add_connected_outputs_info(struct device **devices,
@@ -1129,6 +1234,8 @@ static void add_connected_outputs_info(struct device **devices,
     int radeon_has_outputs = has_driver_connected_outputs("radeon");
     int nouveau_has_outputs = has_driver_connected_outputs("nouveau");
     int intel_has_outputs = has_driver_connected_outputs("i915");
+    int nvidia_has_outputs = has_driver_connected_outputs("nvidia-drm");
+    int test = has_nv_link_output_ports("nvidia-drm");
 
     for(i = 0; i < cards_n; i++) {
         if (devices[i]->vendor_id == INTEL)
@@ -1137,7 +1244,8 @@ static void add_connected_outputs_info(struct device **devices,
             devices[i]->has_connected_outputs = ((radeon_has_outputs != -1) ? radeon_has_outputs
                                                  : amdgpu_has_outputs);
         else if (devices[i]->vendor_id == NVIDIA)
-            devices[i]->has_connected_outputs = nouveau_has_outputs;
+            devices[i]->has_connected_outputs = ((nouveau_has_outputs != -1)) ? nouveau_has_outputs
+                                                : nvidia_has_outputs;
         else
             devices[i]->has_connected_outputs = -1;
     }
@@ -2033,6 +2141,42 @@ static bool create_runtime_file(const char *name) {
     return true;
 }
 
+static bool is_nv_kms_enabled(void){
+    char *nv_modeset="/sys/module/nvidia_drm/parameters/modeset";
+    int fd, ret, cmpret;
+    char val[1];
+    bool status = false;
+
+    /* make sure nvidia_drm loaded with option modeset=1*/
+    if (is_module_loaded("nvidia")) {
+        status = unload_nvidia();
+        //load_module_with_params();
+    }
+
+    fd = open(nv_modeset, O_RDONLY);
+    if(fd < 0){
+        fprintf(log_handle, "File %s open error\n", nv_modeset);
+        return false;
+    }
+
+    ret = read(fd, &val, 1);
+    if (ret < 0){
+        fprintf(log_handle, "File %s read error\n", nv_modeset);
+    }
+
+    close(fd);
+
+    cmpret = strncmp(val, "Y", 1);
+    fprintf(log_handle, "%s: %s\n", __FUNCTION__, cmpret == 0 ? "yes" : "no");
+
+    return false;
+}
+
+static bool has_any_output_ports_link_to_nv_gpu(int nv_device_id){
+    
+
+}
+
 
 int main(int argc, char *argv[]) {
 
@@ -2456,6 +2600,7 @@ int main(int argc, char *argv[]) {
                 /* char *driver = NULL; */
                 if (info->vendor_id == NVIDIA) {
                     has_nvidia = true;
+                    //is_nv_kms_enabled();
                     nvidia_runtimepm_supported = is_nv_runtimepm_supported(info->device_id);
                     fprintf(log_handle, "Is nvidia runtime pm supported for \"0x%x\"? %s\n", info->device_id,
                             nvidia_runtimepm_supported ? "yes" : "no");
